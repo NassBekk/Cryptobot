@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://nassim:datascientest@db:5432/crypto
+    volumes:
+      - ./app:/app/app
+      - ./scripts:/app/scripts
+      - ./models:/app/models
+      - ./data:/app/data
+    networks:
+      - cryptobot-network
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nassim
+      POSTGRES_PASSWORD: datascientest
+      POSTGRES_DB: crypto
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    networks:
+      - cryptobot-network
+    restart: unless-stopped
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8501:8501"
+    depends_on:
+      - app
+    environment:
+      - API_URL=http://app:8000
+    volumes:
+      - ./app:/app/app
+    networks:
+      - cryptobot-network
+    restart: unless-stopped
+
+
+volumes:
+  postgres_data:
+
+networks:
+  cryptobot-network:
+    driver: bridge

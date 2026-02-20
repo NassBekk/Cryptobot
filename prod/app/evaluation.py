@@ -1,0 +1,256 @@
+"""
+Module d'évaluation des modèles de prédiction
+"""
+import pandas as pd
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    classification_report, confusion_matrix, mean_squared_error,
+    mean_absolute_error, r2_score
+)
+from sqlalchemy import create_engine, text
+import os
+import sys
+
+# Ajouter le chemin des scripts pour importer utils
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'scripts'))
+from utils import prepare_features, normalize_features
+
+
+def calculate_rsi(series, window=14):
+    """Calcule le RSI (Relative Strength Index)."""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+
+def load_test_data(db_url: str, symbol: str = None, limit: int = 1000):
+    """
+    Charge les données de test depuis la base de données.
+    
+    Args:
+        db_url: URL de connexion à la base de données
+        symbol: Symbole à filtrer (None pour tous les symboles)
+        limit: Nombre maximum de lignes à charger
+        
+    Returns:
+        DataFrame avec les données (les plus récentes, triées chronologiquement)
+    """
+    engine = create_engine(db_url)
+    
+    # ✅ CORRECTION: Utiliser une sous-requête pour prendre les données RÉCENTES
+    query = """
+        SELECT * FROM (
+            SELECT
+                symbol,
+                timestamp,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                "Quote asset volume",
+                "Number of trades",
+                bid_ask_spread,
+                volume_24h,
+                num_trades_24h
+            FROM binance_historical_data_with_metrics
+    """
+    
+    params = {"limit": limit}
+    if symbol:
+        query += " WHERE symbol = :symbol"
+        params["symbol"] = symbol
+    
+    # ✅ CRITIQUE: DESC pour prendre les plus récentes, puis LIMIT
+    query += """
+            ORDER BY timestamp DESC
+            LIMIT :limit
+        ) AS recent_data
+        ORDER BY timestamp ASC
+    """
+    
+    df = pd.read_sql(text(query), engine, params=params)
+    return df
+
+def prepare_features_for_evaluation(df, scaler):
+    """
+    Prépare les features pour l'évaluation.
+    
+    Args:
+        df: DataFrame avec les données brutes
+        scaler: Scaler pour normaliser les données
+        
+    Returns:
+        Tuple (features, target, df_with_features)
+    """
+    try:
+        # Préparer les features
+        df_features = prepare_features(df.copy())
+        
+        if len(df_features) == 0:
+            return pd.DataFrame(), pd.Series(), pd.DataFrame()
+        
+        # Créer la target (1=hausse, 0=baisse) - même logique que dans data_cleaning
+        df_features['target'] = (df_features.groupby('symbol')['daily_return'].shift(-1) > 0).astype(int)
+        df_features = df_features.dropna(subset=['target'])
+        
+        if len(df_features) == 0:
+            return pd.DataFrame(), pd.Series(), pd.DataFrame()
+        
+        # Séparer features et target AVANT normalisation pour éviter les problèmes
+        features = df_features.drop(columns=['target', 'symbol', 'timestamp'], errors='ignore')
+        target = df_features['target']
+        
+        # Normaliser uniquement les colonnes numériques existantes
+        cols_to_normalize = [col for col in ['open', 'high', 'low', 'close', 'volume', 'Quote asset volume', 
+                                              'Number of trades', 'bid_ask_spread', 'volume_24h', 'num_trades_24h', 
+                                              'ma_7', 'ma_30', 'volatility', 'rsi', 'volume_to_price_ratio'] 
+                            if col in features.columns]
+        
+        if cols_to_normalize and len(features) > 0:
+            features[cols_to_normalize] = scaler.transform(features[cols_to_normalize])
+        
+        return features, target, df_features
+        
+    except Exception as e:
+        print(f"Erreur dans prepare_features_for_evaluation: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame(), pd.Series(), pd.DataFrame()
+
+
+def evaluate_classification_models(model_rf, model_lstm, X_test, y_test):
+    """
+    Évalue les modèles de classification (Random Forest et LSTM).
+    
+    Args:
+        model_rf: Modèle Random Forest
+        model_lstm: Modèle LSTM
+        X_test: Features de test
+        y_test: Valeurs réelles de test
+        
+    Returns:
+        Dict avec les métriques pour chaque modèle
+    """
+    results = {}
+    
+    # Prédictions Random Forest
+    y_pred_rf = model_rf.predict(X_test)
+    results['random_forest'] = {
+        'accuracy': float(accuracy_score(y_test, y_pred_rf)),
+        'precision': float(precision_score(y_test, y_pred_rf, average='binary', zero_division=0)),
+        'recall': float(recall_score(y_test, y_pred_rf, average='binary', zero_division=0)),
+        'f1_score': float(f1_score(y_test, y_pred_rf, average='binary', zero_division=0)),
+        'confusion_matrix': confusion_matrix(y_test, y_pred_rf).tolist()
+    }
+    
+    # Prédictions LSTM
+    X_test_lstm = X_test.values.reshape((X_test.shape[0], 1, X_test.shape[1]))
+    y_pred_lstm_proba = model_lstm.predict(X_test_lstm, verbose=0)
+    y_pred_lstm = (y_pred_lstm_proba > 0.5).astype(int).flatten()
+    
+    results['lstm'] = {
+        'accuracy': float(accuracy_score(y_test, y_pred_lstm)),
+        'precision': float(precision_score(y_test, y_pred_lstm, average='binary', zero_division=0)),
+        'recall': float(recall_score(y_test, y_pred_lstm, average='binary', zero_division=0)),
+        'f1_score': float(f1_score(y_test, y_pred_lstm, average='binary', zero_division=0)),
+        'confusion_matrix': confusion_matrix(y_test, y_pred_lstm).tolist()
+    }
+    
+    return results
+
+
+def evaluate_time_series_models(model_arima, model_sarimax, test_data):
+    """
+    Évalue les modèles de séries temporelles (ARIMA et SARIMAX).
+    
+    Args:
+        model_arima: Modèle ARIMA (peut être None)
+        model_sarimax: Modèle SARIMAX (peut être None)
+        test_data: Données de test (Series avec index datetime)
+        
+    Returns:
+        Dict avec les métriques pour chaque modèle
+    """
+    results = {}
+    
+    if model_arima is not None:
+        try:
+            # Prédictions ARIMA
+            arima_pred = model_arima.forecast(steps=len(test_data))
+            results['arima'] = {
+                'mse': float(mean_squared_error(test_data, arima_pred)),
+                'mae': float(mean_absolute_error(test_data, arima_pred)),
+                'rmse': float(np.sqrt(mean_squared_error(test_data, arima_pred))),
+                'r2_score': float(r2_score(test_data, arima_pred))
+            }
+        except Exception as e:
+            results['arima'] = {'error': str(e)}
+    else:
+        results['arima'] = {'error': 'Model not available'}
+    
+    if model_sarimax is not None:
+        try:
+            # Prédictions SARIMAX
+            sarimax_pred = model_sarimax.forecast(steps=len(test_data))
+            results['sarimax'] = {
+                'mse': float(mean_squared_error(test_data, sarimax_pred)),
+                'mae': float(mean_absolute_error(test_data, sarimax_pred)),
+                'rmse': float(np.sqrt(mean_squared_error(test_data, sarimax_pred))),
+                'r2_score': float(r2_score(test_data, sarimax_pred))
+            }
+        except Exception as e:
+            results['sarimax'] = {'error': str(e)}
+    else:
+        results['sarimax'] = {'error': 'Model not available'}
+    
+    return results
+
+
+def get_predictions_comparison(model_rf, model_lstm, X_test, y_test, timestamps, symbols=None, actual_prices=None):
+    """
+    Génère un DataFrame comparant les prédictions aux valeurs réelles.
+    
+    Args:
+        model_rf: Modèle Random Forest
+        model_lstm: Modèle LSTM
+        X_test: Features de test
+        y_test: Valeurs réelles
+        timestamps: Timestamps correspondants
+        symbols: Symboles correspondants (optionnel)
+        actual_prices: Prix réels non normalisés (optionnel)
+        
+    Returns:
+        DataFrame avec les comparaisons
+    """
+    # Prédictions
+    y_pred_rf = model_rf.predict(X_test)
+    X_test_lstm = X_test.values.reshape((X_test.shape[0], 1, X_test.shape[1]))
+    y_pred_lstm_proba = model_lstm.predict(X_test_lstm, verbose=0)
+    y_pred_lstm = (y_pred_lstm_proba > 0.5).astype(int).flatten()
+    
+    # Créer le DataFrame de comparaison
+    comparison_df = pd.DataFrame({
+        'timestamp': timestamps,
+        'actual': y_test.values,
+        'prediction_rf': y_pred_rf,
+        'prediction_lstm': y_pred_lstm,
+        'correct_rf': (y_test.values == y_pred_rf),
+        'correct_lstm': (y_test.values == y_pred_lstm)
+    })
+    
+    if symbols is not None:
+        comparison_df['symbol'] = symbols
+    
+    # ✅ CORRECTION: Changer 'price' en 'actual_price' pour cohérence
+    if actual_prices is not None:
+        comparison_df['actual_price'] = actual_prices
+        # ✅ AJOUT: Log pour vérifier les prix
+        print(f"✓ actual_price ajouté au DataFrame: min={actual_prices.min():.2f}, max={actual_prices.max():.2f}")
+    else:
+        print("⚠️ WARNING: actual_prices est None - les prix réels ne seront pas disponibles!")
+    
+    return comparison_df

@@ -1,0 +1,21 @@
+version: '3.8'
+services:
+  db:
+    container_name: db_projet_container
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: nassim
+      POSTGRES_PASSWORD: datascientest
+      POSTGRES_DB: crypto
+    ports:
+      - "5432:5432"
+  pgadmin:
+    container_name: pgadmin_projet_container
+    image: dpage/pgadmin4
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: nassim@crypto.com
+      PGADMIN_DEFAULT_PASSWORD: bitcoin
+    ports:
+      - "5050:80"
