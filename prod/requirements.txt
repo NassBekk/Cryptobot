@@ -1,5 +1,6 @@
 pandas==2.2.0
 numpy==1.26.4
+pyarrow==23.0.1
 scikit-learn==1.7.2
 tensorflow==2.16.1
 statsmodels==0.14.1
