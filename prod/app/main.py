@@ -357,8 +357,10 @@ async def predict(request: PredictionRequest):
                 "sarimax_note": sarimax_error
             }
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la prédiction: {e}")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Erreur lors de la prédiction")
 
 def calculate_rsi(series, window=14):
     delta = series.diff()
